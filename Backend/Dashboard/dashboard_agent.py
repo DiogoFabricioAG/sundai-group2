@@ -1,4 +1,5 @@
 import json
+import re
 from typing import TypedDict
 
 from dotenv import load_dotenv
@@ -7,6 +8,53 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
 load_dotenv()
+
+
+def parse_json(text: str | list) -> dict | list:
+    """
+    Parsea JSON de la respuesta del LLM con 3 estrategias de fallback:
+      1. Parseo directo.
+      2. Eliminar bloque de markdown (```json ... ``` o ``` ... ```).
+      3. Extraer el primer objeto/arreglo JSON encontrado en el texto.
+
+    También maneja el caso en que `response.content` es una lista de partes
+    (comportamiento ocasional de langchain-google-genai).
+    """
+    # Normalizar a string si el modelo devuelve lista de partes
+    if isinstance(text, list):
+        parts = []
+        for part in text:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(part.get("text", ""))
+        text = "\n".join(parts)
+
+    text = text.strip()
+
+    # Estrategia 1 — parseo directo
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Estrategia 2 — eliminar bloque de markdown
+    clean = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
+    clean = re.sub(r"\n?```\s*$", "", clean).strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    # Estrategia 3 — extraer primer objeto o arreglo JSON del texto
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"No se pudo parsear JSON. Respuesta recibida:\n{text[:300]}")
 
 
 class DashboardState(TypedDict):
@@ -18,7 +66,7 @@ class DashboardState(TypedDict):
 
 
 def create_dashboard_agent():
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-3-flash-preview", temperature=0)
 
     def analyze_sentiment(state: DashboardState) -> dict:
         """Nodo 1: Calcula scores de sentimiento por categoría."""
@@ -42,7 +90,7 @@ Analiza los feedbacks y devuelve ÚNICAMENTE un JSON válido (sin markdown, sin 
         ]
         try:
             response = llm.invoke(messages)
-            scores = json.loads(response.content)
+            scores = parse_json(response.content)
             return {"sentiment_scores": scores}
         except Exception as e:
             return {"error": str(e), "sentiment_scores": {}}
@@ -68,7 +116,7 @@ Extrae los temas principales de los feedbacks y devuelve ÚNICAMENTE un JSON vá
         ]
         try:
             response = llm.invoke(messages)
-            themes = json.loads(response.content)
+            themes = parse_json(response.content)
             return {"key_themes": themes}
         except Exception as e:
             return {"error": str(e), "key_themes": {}}
@@ -93,7 +141,7 @@ y devuelve ÚNICAMENTE un JSON válido (sin markdown) con:
         ]
         try:
             response = llm.invoke(messages)
-            summary = json.loads(response.content)
+            summary = parse_json(response.content)
             return {"summary": summary}
         except Exception as e:
             return {"error": str(e), "summary": {}}
