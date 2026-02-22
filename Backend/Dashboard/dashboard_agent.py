@@ -22,6 +22,53 @@ if not logging.getLogger().handlers:
     )
 
 
+def parse_json(text: str | list) -> dict | list:
+    """
+    Parsea JSON de la respuesta del LLM con 3 estrategias de fallback:
+      1. Parseo directo.
+      2. Eliminar bloque de markdown (```json ... ``` o ``` ... ```).
+      3. Extraer el primer objeto/arreglo JSON encontrado en el texto.
+
+    También maneja el caso en que `response.content` es una lista de partes
+    (comportamiento ocasional de langchain-google-genai).
+    """
+    # Normalizar a string si el modelo devuelve lista de partes
+    if isinstance(text, list):
+        parts = []
+        for part in text:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(part.get("text", ""))
+        text = "\n".join(parts)
+
+    text = text.strip()
+
+    # Estrategia 1 — parseo directo
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Estrategia 2 — eliminar bloque de markdown
+    clean = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
+    clean = re.sub(r"\n?```\s*$", "", clean).strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    # Estrategia 3 — extraer primer objeto o arreglo JSON del texto
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"No se pudo parsear JSON. Respuesta recibida:\n{text[:300]}")
+
+
 class DashboardState(TypedDict):
     raw_data: str
     sentiment_scores: dict
