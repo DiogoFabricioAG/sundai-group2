@@ -3,10 +3,14 @@ import logging
 import re
 from typing import TypedDict
 
+import pandas as pd
+
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
+
+from Backend.Dashboard.tag_analytics import run_incremental_tag_pipeline
 
 load_dotenv()
 
@@ -24,6 +28,7 @@ class DashboardState(TypedDict):
     key_themes: dict
     summary: dict
     error: str
+    metadata: dict
 
 
 def _parse_llm_json(content, node_name: str) -> dict:
@@ -63,7 +68,7 @@ def _parse_llm_json(content, node_name: str) -> dict:
 
 
 def create_dashboard_agent():
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 
     def analyze_sentiment(state: DashboardState) -> dict:
         """Nodo 1: Calcula scores de sentimiento por categoría."""
@@ -182,6 +187,7 @@ def run_dashboard_agent(data_text: str) -> DashboardState:
         "key_themes": {},
         "summary": {},
         "error": "",
+        "metadata": {},
     }
 
     try:
@@ -206,3 +212,31 @@ def run_dashboard_agent(data_text: str) -> DashboardState:
     except Exception:
         logger.exception("[run_dashboard_agent] Error no controlado durante la ejecución")
         raise
+
+
+def run_dashboard_agent_from_df(df: pd.DataFrame) -> DashboardState:
+    """Ejecuta análisis incremental por tags con persistencia en CSV."""
+    logger.info("[run_dashboard_agent_from_df] Inicio de pipeline incremental")
+    logger.info("[run_dashboard_agent_from_df] Filas recibidas: %s", len(df))
+
+    result = run_incremental_tag_pipeline(df)
+
+    if result.get("error"):
+        logger.error("[run_dashboard_agent_from_df] Error: %s", result.get("error"))
+    else:
+        metadata = result.get("metadata", {})
+        logger.info(
+            "[run_dashboard_agent_from_df] OK | nuevos_rows=%s | nuevos_events=%s | total_events=%s",
+            metadata.get("new_rows_processed", 0),
+            metadata.get("new_tag_events", 0),
+            metadata.get("events", 0),
+        )
+
+    return {
+        "raw_data": "",
+        "sentiment_scores": result.get("sentiment_scores", {}),
+        "key_themes": result.get("key_themes", {}),
+        "summary": result.get("summary", {}),
+        "error": result.get("error", ""),
+        "metadata": result.get("metadata", {}),
+    }
