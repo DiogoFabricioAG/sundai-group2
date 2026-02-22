@@ -1,15 +1,30 @@
+import base64
 import json
+import logging
 import os
 import re
-from typing import List
+from typing import List, TypedDict
 
-from dotenv import load_dotenv
 import openai
-from google import genai
+from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, StateGraph
+from langgraph.types import interrupt
 
 load_dotenv()
+
+logger = logging.getLogger("marketing_agent")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.DEBUG)
+
+_checkpointer = MemorySaver()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -47,20 +62,55 @@ def _get_llm(temperature: float = 0.0) -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(model="gemini-flash-lite-latest", temperature=temperature)
 
 
-# ── 1. Extracción de platos top ───────────────────────────────────────────────
+def _generate_image_bytes(prompt: str) -> bytes:
+    """Genera imagen vía OpenAI gpt-image-1. Devuelve bytes."""
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY no está configurada en el entorno.")
+
+    client = openai.OpenAI(api_key=api_key)
+    logger.info("Llamando a OpenAI gpt-image-1…")
+
+    result = client.images.generate(
+        model="gpt-image-1",
+        prompt=prompt,
+        n=1,
+        size="1536x1024",
+    )
+
+    b64_data = result.data[0].b64_json
+    if not b64_data:
+        raise RuntimeError("No se recibió imagen en la respuesta de OpenAI.")
+
+    img_bytes = base64.b64decode(b64_data)
+    logger.info("Imagen recibida: %s bytes", f"{len(img_bytes):,}")
+    return img_bytes
+
+
+def _build_image_prompt(dishes: List[str], extra: str = "") -> str:
+    dishes_str = " and ".join(dishes[:3])
+    base = (
+        f"Professional food photography for a Peruvian restaurant marketing campaign. "
+        f"Hero dishes: {dishes_str}. "
+        f"Style: vibrant and appetizing, warm golden-hour lighting, "
+        f"elegant plating on a rustic wooden table with Andean textiles, "
+        f"fresh colorful ingredients visible around the dish, "
+        f"shallow depth of field, bokeh background, "
+        f"high-end food magazine quality, wide 16:9 format. "
+        f"No text overlays. No people."
+    )
+    if extra:
+        base += f" Additional art direction: {extra}"
+    return base
+
+
+# ── 1. Extracción de platos (standalone, cacheado en Streamlit) ───────────────
 
 def extract_top_dishes(food_responses: List[str], top_n: int = 10) -> List[dict]:
-    """
-    Usa LLM para identificar y rankear los platos más mencionados
-    en las respuestas de feedback de comida.
-    Devuelve lista de {"plato": str, "menciones": int} ordenada desc.
-    """
     llm = _get_llm(temperature=0)
-
     clean = [str(r) for r in food_responses if str(r).strip() not in ("", "nan", "NaN")]
     combined = "\n".join(f"- {r}" for r in clean)
-
-    print(f"[Marketing] Analizando {len(clean)} respuestas de comida...")
+    logger.info("Analizando %d respuestas de comida…", len(clean))
 
     system = """Eres un analista de datos para restaurantes peruanos.
 Analiza las respuestas de clientes sobre qué les gustó más de la comida.
@@ -88,30 +138,36 @@ Máximo 10 platos, ordenados de mayor a menor mención."""
 
     try:
         response = llm.invoke(messages)
-        raw = response.content
-        print(f"[Marketing] Respuesta LLM (platos): {str(raw)[:300]}")
-        data = _parse_json(raw)
+        data = _parse_json(response.content)
         dishes = data.get("platos", [])[:top_n]
-        print(f"[Marketing] Platos extraídos: {[d['plato'] for d in dishes]}")
+        logger.info("Platos extraídos: %s", [d["plato"] for d in dishes])
         return dishes
     except Exception as e:
-        print(f"[Marketing] Error extrayendo platos: {e}")
+        logger.error("Error extrayendo platos: %s", e)
         return []
 
 
-# ── 2. Generación de texto de campaña ─────────────────────────────────────────
+# ── 2. LangGraph — Estado y Grafo ────────────────────────────────────────────
 
-def generate_campaign_text(selected_dishes: List[str]) -> str:
-    """
-    Genera un texto creativo de campaña de marketing para redes sociales
-    basado en los platos seleccionados.
-    """
-    llm = _get_llm(temperature=0.9)
-    dishes_str = ", ".join(selected_dishes)
+class MarketingState(TypedDict):
+    selected_dishes: List[str]
+    campaign_text: str
+    image_bytes: bytes
+    approved_text: str
+    approved_image: bytes
+    error: str
 
-    print(f"[Marketing] Generando texto para: {dishes_str}")
 
-    system = """Eres un copywriter creativo especializado en gastronomía peruana.
+def create_marketing_agent():
+    """Crea el grafo LangGraph: generate_text → generate_image → human_review."""
+
+    # ── Nodo 1: Generar texto ──────────────────────────────────────────────
+    def generate_text(state: MarketingState) -> dict:
+        logger.info("── generate_text START ──")
+        llm = _get_llm(temperature=0.9)
+        dishes_str = ", ".join(state["selected_dishes"])
+
+        system = """Eres un copywriter creativo especializado en gastronomía peruana.
 Crea un texto de campaña de marketing para redes sociales que:
 - Sea apasionante, evocador y apetecible
 - Mencione los platos de forma poética y sensorial
@@ -123,60 +179,113 @@ Crea un texto de campaña de marketing para redes sociales que:
 
 Devuelve ÚNICAMENTE el texto de la campaña, sin JSON, sin comillas extra."""
 
+        messages = [
+            SystemMessage(content=system),
+            HumanMessage(content=f"Platos para la campaña: {dishes_str}"),
+        ]
+
+        try:
+            response = llm.invoke(messages)
+            text = response.content
+            if isinstance(text, list):
+                text = " ".join(
+                    p if isinstance(p, str) else p.get("text", "") for p in text
+                )
+            text = text.strip()
+            logger.info("── generate_text END ── %d chars", len(text))
+            return {"campaign_text": text}
+        except Exception as e:
+            logger.error("Error generando texto: %s", e)
+            return {"error": f"Error generando texto: {e}"}
+
+    # ── Nodo 2: Generar imagen ─────────────────────────────────────────────
+    def generate_image(state: MarketingState) -> dict:
+        if state.get("error"):
+            return {}
+        logger.info("── generate_image START ──")
+        try:
+            prompt = _build_image_prompt(state["selected_dishes"])
+            img_bytes = _generate_image_bytes(prompt)
+            logger.info("── generate_image END ── %s bytes", f"{len(img_bytes):,}")
+            return {"image_bytes": img_bytes}
+        except Exception as e:
+            logger.error("Error generando imagen: %s", e)
+            return {"error": f"Error generando imagen: {e}"}
+
+    # ── Nodo 3: Human-in-the-loop ──────────────────────────────────────────
+    def human_review(state: MarketingState) -> dict:
+        logger.info("── human_review ── esperando revisión humana")
+        approved = interrupt({
+            "campaign_text": state.get("campaign_text", ""),
+            "image_bytes": state.get("image_bytes", b""),
+        })
+        logger.info("── human_review RESUMED ── campaña aprobada")
+        return {
+            "approved_text": approved.get("campaign_text", state.get("campaign_text", "")),
+            "approved_image": approved.get("image_bytes", state.get("image_bytes", b"")),
+        }
+
+    # ── Construcción del grafo ─────────────────────────────────────────────
+    graph = StateGraph(MarketingState)
+    graph.add_node("generate_text", generate_text)
+    graph.add_node("generate_image", generate_image)
+    graph.add_node("human_review", human_review)
+
+    graph.set_entry_point("generate_text")
+    graph.add_edge("generate_text", "generate_image")
+    graph.add_edge("generate_image", "human_review")
+    graph.add_edge("human_review", END)
+
+    return graph.compile(checkpointer=_checkpointer)
+
+
+# ── 3. Funciones standalone para HITL ─────────────────────────────────────────
+
+def regenerate_campaign_text(current_text: str, dishes: List[str], instructions: str) -> str:
+    """Regenera el texto de campaña siguiendo instrucciones del humano."""
+    logger.info("── regenerate_campaign_text ── instrucciones: %s", instructions[:80])
+    llm = _get_llm(temperature=0.9)
+
+    system = """Eres un copywriter creativo especializado en gastronomía peruana.
+Tienes un texto de campaña ya generado y debes modificarlo siguiendo
+exactamente las instrucciones del revisor humano.
+
+Reglas:
+- Mantén el tono cálido, auténtico y peruano
+- Sigue las instrucciones de cambio al pie de la letra
+- Máximo 5 líneas en total
+- Termina con un call-to-action y un hashtag
+
+Devuelve ÚNICAMENTE el texto modificado, sin JSON, sin comillas extra."""
+
     messages = [
         SystemMessage(content=system),
-        HumanMessage(content=f"Platos para la campaña: {dishes_str}"),
+        HumanMessage(
+            content=(
+                f"Platos de la campaña: {', '.join(dishes)}\n\n"
+                f"Texto actual:\n{current_text}\n\n"
+                f"Instrucciones del revisor:\n{instructions}"
+            )
+        ),
     ]
 
-    response = llm.invoke(messages)
-    text = response.content
-    if isinstance(text, list):
-        text = " ".join(p if isinstance(p, str) else p.get("text", "") for p in text)
-    result = text.strip()
-    print(f"[Marketing] Texto generado:\n{result}")
-    return result
+    try:
+        response = llm.invoke(messages)
+        text = response.content
+        if isinstance(text, list):
+            text = " ".join(
+                p if isinstance(p, str) else p.get("text", "") for p in text
+            )
+        result = text.strip()
+        logger.info("Texto regenerado: %d chars", len(result))
+        return result
+    except Exception as e:
+        logger.error("Error regenerando texto: %s", e)
+        return current_text
 
 
-# ── 3. Generación de imagen con OpenAI (DALL·E) ──────────────────────────────
-
-def generate_campaign_image(selected_dishes: List[str]) -> bytes:
-    """
-    Genera una imagen de campaña usando la API de OpenAI (gpt-image-1).
-    Devuelve los bytes PNG de la imagen.
-    """
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY no está configurada en el entorno.")
-
-    client = openai.OpenAI(api_key=api_key)
-
-    dishes_str = " and ".join(selected_dishes[:3])
-    prompt = (
-        f"Professional food photography for a Peruvian restaurant marketing campaign. "
-        f"Hero dishes: {dishes_str}. "
-        f"Style: vibrant and appetizing, warm golden-hour lighting, "
-        f"elegant plating on a rustic wooden table with Andean textiles, "
-        f"fresh colorful ingredients visible around the dish, "
-        f"shallow depth of field, bokeh background, "
-        f"high-end food magazine quality, wide 16:9 format. "
-        f"No text overlays. No people."
-    )
-
-    print(f"[Marketing] Generando imagen con OpenAI...")
-    print(f"[Marketing] Prompt: {prompt}")
-
-    result = client.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        n=1,
-        size="1536x1024",
-    )
-
-    b64_data = result.data[0].b64_json
-    if not b64_data:
-        raise RuntimeError("No se recibió imagen en la respuesta de OpenAI.")
-
-    import base64
-    img_bytes = base64.b64decode(b64_data)
-    print(f"[Marketing] Imagen generada: {len(img_bytes):,} bytes")
-    return img_bytes
+def regenerate_campaign_image(dishes: List[str], instructions: str) -> bytes:
+    """Regenera la imagen de campaña con instrucciones adicionales del humano."""
+    logger.info("── regenerate_campaign_image ── instrucciones: %s", instructions[:80])
+    prompt = _build_image_prompt(dishes, extra=instructions)
+    return _generate_image_bytes(prompt)
