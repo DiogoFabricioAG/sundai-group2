@@ -22,7 +22,6 @@ def parse_json(text: str | list) -> dict | list:
     También maneja el caso en que `response.content` es una lista de partes
     (comportamiento ocasional de langchain-google-genai).
     """
-    # Normalizar a string si el modelo devuelve lista de partes
     if isinstance(text, list):
         parts = []
         for part in text:
@@ -34,13 +33,11 @@ def parse_json(text: str | list) -> dict | list:
 
     text = text.strip()
 
-    # Estrategia 1 — parseo directo
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Estrategia 2 — eliminar bloque de markdown
     clean = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
     clean = re.sub(r"\n?```\s*$", "", clean).strip()
     try:
@@ -48,7 +45,6 @@ def parse_json(text: str | list) -> dict | list:
     except json.JSONDecodeError:
         pass
 
-    # Estrategia 3 — extraer primer objeto o arreglo JSON del texto
     match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
     if match:
         try:
@@ -59,6 +55,10 @@ def parse_json(text: str | list) -> dict | list:
     raise ValueError(f"No se pudo parsear JSON. Respuesta recibida:\n{text[:300]}")
 
 
+def _get_llm() -> ChatGoogleGenerativeAI:
+    return ChatGoogleGenerativeAI(model="gemini-3-flash-preview", temperature=0)
+
+
 # Checkpointer compartido en memoria (persiste durante la sesión del servidor)
 _checkpointer = MemorySaver()
 
@@ -66,27 +66,28 @@ _checkpointer = MemorySaver()
 class LeadsState(TypedDict):
     raw_data: str
     customer_data: str
-    spending_threshold: float   # filtro cuantitativo: gasto mínimo
-    scored_leads: List[dict]    # leads calificados (cuali + cuanti)
-    promotions: List[dict]      # leads + mensaje promocional generado
-    approved_leads: List[dict]  # leads aprobados por el humano (post-HITL)
+    spending_threshold: float       # filtro cuantitativo: gasto mínimo
+    categorized_leads: List[dict]   # {id_cliente, consumo, categoria, motivo}
+    promotions: List[dict]          # {id_cliente, telefono, consumo, categoria, motivo, mensaje_promo}
+    approved_leads: List[dict]      # leads aprobados por el humano (post-HITL)
     error: str
 
 
 def create_leads_agent():
-    llm = ChatGoogleGenerativeAI(model="gemini-3-flash-preview", temperature=0)
+    llm = _get_llm()
 
     # ── Nodo 1 ────────────────────────────────────────────────────────────────
-    def filter_and_score(state: LeadsState) -> dict:
+    def categorize_clients(state: LeadsState) -> dict:
         """
-        Filtro cuantitativo: descarta clientes que gastaron menos del umbral.
-        Luego usa el LLM para scoring cualitativo sobre los clientes calificados.
+        1) Filtro cuantitativo: descarta clientes con gasto < umbral.
+        2) Para cada cliente calificado, llama al LLM individualmente
+           para determinar su categoría de lead (sin score).
         """
         threshold = state.get("spending_threshold", 0.0)
 
-        # Parsear datos de gasto desde customer_data (formato: ID | Tel | Consumo)
+        # Parsear gasto desde customer_data (formato: ID | Tel | Consumo)
         spending_info: dict[int, float] = {}
-        for line in state["customer_data"].split("\n")[1:]:  # skip header
+        for line in state["customer_data"].split("\n")[1:]:
             parts = [p.strip() for p in line.split("|")]
             if len(parts) >= 3:
                 try:
@@ -99,71 +100,68 @@ def create_leads_agent():
         if not qualified_ids:
             return {
                 "error": f"No hay clientes con gasto >= S/. {threshold:.2f}",
-                "scored_leads": [],
+                "categorized_leads": [],
             }
 
-        # Filtrar bloques de feedback a solo los clientes calificados
-        filtered_blocks = [
-            block
-            for block in state["raw_data"].split("\n\n")
-            if (m := re.match(r"Cliente (\d+):", block.strip()))
-            and int(m.group(1)) in qualified_ids
-        ]
-        filtered_data = "\n\n".join(filtered_blocks)
+        # Parsear bloques de feedback en un dict {id_cliente: texto}
+        feedback_blocks: dict[int, str] = {}
+        for block in state["raw_data"].split("\n\n"):
+            m = re.match(r"Cliente (\d+):", block.strip())
+            if m:
+                feedback_blocks[int(m.group(1))] = block.strip()
 
-        system = """Eres un experto en CRM y marketing para restaurantes peruanos.
-Los clientes ya fueron pre-filtrados por un umbral de gasto mínimo (filtro cuantitativo).
-Ahora realiza el scoring CUALITATIVO basándote en el sentimiento del feedback.
+        system = """Eres un experto en CRM para restaurantes peruanos.
+Analiza el feedback de UN cliente y determina su categoría de lead.
 
-Categorías:
-- "alto_valor": gasto alto + satisfacción alta → potencial VIP
-- "retencion": tuvo mala experiencia pero es recuperable con atención personalizada
-- "recurrente": su feedback indica que definitivamente volverá
-- "referidor": recomienda el lugar o puede traer nuevos clientes
+Categorías (elige exactamente una):
+- "alto_valor"  : gasto alto + satisfacción alta → potencial VIP
+- "retencion"   : tuvo mala experiencia pero es recuperable con atención personalizada
+- "recurrente"  : su feedback indica claramente que volverá
+- "referidor"   : recomienda el lugar o tiene perfil para traer nuevos clientes
 
-Solo incluye clientes con score cualitativo >= 6.
-
-Devuelve ÚNICAMENTE un JSON válido (sin markdown, sin bloques de código):
+Devuelve ÚNICAMENTE un JSON válido (sin markdown):
 {
-  "leads": [
-    {
-      "id_cliente": <número>,
-      "score": <entero 1-10>,
-      "categoria": "<alto_valor|retencion|recurrente|referidor>",
-      "motivo": "<una oración explicando el score combinado cuali+cuantitativo>"
-    }
-  ]
+  "categoria": "<alto_valor|retencion|recurrente|referidor>",
+  "motivo": "<una oración explicando la categoría asignada>"
 }"""
-        messages = [
-            SystemMessage(content=system),
-            HumanMessage(
-                content=(
-                    f"Feedbacks pre-filtrados (umbral de gasto: S/. {threshold:.2f}):\n\n"
-                    f"{filtered_data}\n\n"
-                    f"Referencia de gasto por cliente:\n{state['customer_data']}"
-                )
-            ),
-        ]
-        try:
-            response = llm.invoke(messages)
-            result = parse_json(response.content)
-            # Enriquecer leads con consumo real
-            leads = [
-                {**lead, "consumo": spending_info.get(lead["id_cliente"], 0.0)}
-                for lead in result.get("leads", [])
+
+        # Procesar cliente por cliente para no saturar el contexto
+        categorized: List[dict] = []
+        for client_id in sorted(qualified_ids, key=lambda x: spending_info[x], reverse=True):
+            feedback = feedback_blocks.get(client_id)
+            if not feedback:
+                continue
+
+            messages = [
+                SystemMessage(content=system),
+                HumanMessage(content=f"Feedback del cliente:\n{feedback}"),
             ]
-            leads.sort(key=lambda x: x.get("score", 0), reverse=True)
-            return {"scored_leads": leads}
-        except Exception as e:
-            return {"error": str(e), "scored_leads": []}
+            try:
+                response = llm.invoke(messages)
+                result = parse_json(response.content)
+                categorized.append({
+                    "id_cliente": client_id,
+                    "consumo": spending_info[client_id],
+                    "categoria": result.get("categoria", "recurrente"),
+                    "motivo": result.get("motivo", ""),
+                })
+            except Exception as e:
+                categorized.append({
+                    "id_cliente": client_id,
+                    "consumo": spending_info[client_id],
+                    "categoria": "recurrente",
+                    "motivo": f"Categorización por defecto (error: {str(e)[:60]})",
+                })
+
+        return {"categorized_leads": categorized}
 
     # ── Nodo 2 ────────────────────────────────────────────────────────────────
     def generate_promotions(state: LeadsState) -> dict:
         """
-        Para cada lead genera un mensaje promocional personalizado
-        listo para enviar por WhatsApp.
+        Para cada lead categorizado genera un mensaje promocional personalizado
+        de WhatsApp, procesando uno por uno para controlar el contexto.
         """
-        if state.get("error") or not state.get("scored_leads"):
+        if state.get("error") or not state.get("categorized_leads"):
             return {"promotions": []}
 
         # Mapa de contacto: id_cliente → {telefono, consumo}
@@ -179,82 +177,126 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown, sin bloques de código):
                 except ValueError:
                     continue
 
-        leads_json = json.dumps(state["scored_leads"], ensure_ascii=False, indent=2)
+        # Bloques de feedback: {id_cliente: texto}
+        feedback_blocks: dict[int, str] = {}
+        for block in state["raw_data"].split("\n\n"):
+            m = re.match(r"Cliente (\d+):", block.strip())
+            if m:
+                feedback_blocks[int(m.group(1))] = block.strip()
 
         system = """Eres copywriter experto en marketing de restaurantes peruanos.
-Para cada lead genera un mensaje de WhatsApp personalizado y convincente que:
+Genera un mensaje de WhatsApp personalizado para el cliente que:
 - Sea cálido, breve y natural (máximo 3-4 oraciones)
-- Mencione algo específico de su experiencia en el restaurante
-- Ofrezca una promoción concreta según su categoría:
-  * alto_valor  → invitación VIP / mesa reservada / descuento exclusivo
-  * retencion   → disculpa sincera + regalo o descuento especial para recuperar su confianza
-  * recurrente  → beneficio por fidelidad / bienvenida anticipada
-  * referidor   → invitación para traer un amigo + beneficio doble para ambos
-- Termine con un call-to-action claro (ej: "Reserva al XXX-XXXX")
+- Mencione algo específico de su experiencia
+- Ofrezca una promoción concreta según la categoría:
+  * alto_valor → invitación VIP / mesa reservada / descuento exclusivo
+  * retencion  → disculpa sincera + regalo o descuento para recuperar su confianza
+  * recurrente → beneficio por fidelidad / bienvenida anticipada
+  * referidor  → invitación para traer un amigo + beneficio doble
+- Termine con un call-to-action claro
 
-Devuelve ÚNICAMENTE un JSON válido (sin markdown, sin bloques de código):
+Devuelve ÚNICAMENTE un JSON válido (sin markdown):
 {
-  "promotions": [
-    {
-      "id_cliente": <número>,
-      "mensaje_promo": "<mensaje de WhatsApp personalizado>"
-    }
-  ]
+  "mensaje_promo": "<mensaje de WhatsApp personalizado>"
 }"""
-        messages = [
-            SystemMessage(content=system),
-            HumanMessage(
-                content=(
-                    f"Leads a los que generar promoción:\n{leads_json}\n\n"
-                    f"Feedbacks originales (para personalizar el mensaje):\n{state['raw_data']}"
-                )
-            ),
-        ]
-        try:
-            response = llm.invoke(messages)
-            result = parse_json(response.content)
-            promo_map = {
-                p["id_cliente"]: p["mensaje_promo"]
-                for p in result.get("promotions", [])
-            }
-            promotions = []
-            for lead in state["scored_leads"]:
-                id_c = lead["id_cliente"]
-                contact = contact_map.get(id_c, {})
-                promotions.append(
-                    {
-                        "id_cliente": id_c,
-                        "telefono": contact.get("telefono", "—"),
-                        "consumo": lead.get("consumo", 0.0),
-                        "score": lead["score"],
-                        "categoria": lead["categoria"],
-                        "motivo": lead["motivo"],
-                        "mensaje_promo": promo_map.get(id_c, ""),
-                    }
-                )
-            return {"promotions": promotions}
-        except Exception as e:
-            return {"error": str(e), "promotions": []}
+
+        promotions: List[dict] = []
+        for lead in state["categorized_leads"]:
+            id_c = lead["id_cliente"]
+            feedback = feedback_blocks.get(id_c, "Sin feedback disponible.")
+            contact = contact_map.get(id_c, {})
+
+            messages = [
+                SystemMessage(content=system),
+                HumanMessage(
+                    content=(
+                        f"Categoría: {lead['categoria']}\n"
+                        f"Motivo: {lead['motivo']}\n"
+                        f"Feedback original del cliente:\n{feedback}"
+                    )
+                ),
+            ]
+            try:
+                response = llm.invoke(messages)
+                result = parse_json(response.content)
+                mensaje = result.get("mensaje_promo", "")
+            except Exception as e:
+                mensaje = f"[Error al generar mensaje: {str(e)[:60]}]"
+
+            promotions.append({
+                "id_cliente": id_c,
+                "telefono": contact.get("telefono", "—"),
+                "consumo": lead["consumo"],
+                "categoria": lead["categoria"],
+                "motivo": lead["motivo"],
+                "mensaje_promo": mensaje,
+            })
+
+        return {"promotions": promotions}
 
     # ── Nodo 3 — HITL ─────────────────────────────────────────────────────────
     def human_review(state: LeadsState) -> dict:
         """
         Human-in-the-loop: pausa el grafo y devuelve las promociones al frontend.
-        El humano puede aprobar, rechazar o editar cada mensaje.
-        La ejecución se reanuda cuando el frontend llama a Command(resume=...).
+        Se reanuda con Command(resume=leads_aprobados).
         """
         approved = interrupt(state["promotions"])
         return {"approved_leads": approved}
 
     # ── Construcción del grafo ─────────────────────────────────────────────────
     graph = StateGraph(LeadsState)
-    graph.add_node("filter_and_score", filter_and_score)
+    graph.add_node("categorize_clients", categorize_clients)
     graph.add_node("generate_promotions", generate_promotions)
     graph.add_node("human_review", human_review)
 
-    graph.set_entry_point("filter_and_score")
-    graph.add_edge("filter_and_score", "generate_promotions")
+    graph.set_entry_point("categorize_clients")
+    graph.add_edge("categorize_clients", "generate_promotions")
     graph.add_edge("generate_promotions", "human_review")
     graph.add_edge("human_review", END)
 
     return graph.compile(checkpointer=_checkpointer)
+
+
+# ── Función standalone para el HITL ───────────────────────────────────────────
+def regenerate_single_promotion(lead: dict, instructions: str, feedback: str) -> str:
+    """
+    Regenera el mensaje de promoción para un lead específico
+    siguiendo las instrucciones del revisor humano.
+    Llamado desde el frontend durante la fase de revisión HITL.
+    """
+    llm = _get_llm()
+
+    system = """Eres copywriter experto en marketing de restaurantes peruanos.
+Tienes un mensaje de WhatsApp ya generado para un cliente y debes modificarlo
+siguiendo exactamente las instrucciones del revisor humano.
+
+Reglas:
+- Mantén el tono cálido y personalizado
+- Sigue las instrucciones de cambio al pie de la letra
+- Máximo 3-4 oraciones
+- Termina con un call-to-action
+
+Devuelve ÚNICAMENTE un JSON válido (sin markdown):
+{
+  "mensaje_promo": "<mensaje de WhatsApp modificado>"
+}"""
+
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(
+            content=(
+                f"Categoría del cliente: {lead['categoria']}\n"
+                f"Motivo: {lead['motivo']}\n"
+                f"Feedback original del cliente:\n{feedback}\n\n"
+                f"Mensaje actual:\n{lead.get('mensaje_promo', '')}\n\n"
+                f"Instrucciones del revisor:\n{instructions}"
+            )
+        ),
+    ]
+
+    try:
+        response = llm.invoke(messages)
+        result = parse_json(response.content)
+        return result.get("mensaje_promo", lead.get("mensaje_promo", ""))
+    except Exception:
+        return lead.get("mensaje_promo", "")
