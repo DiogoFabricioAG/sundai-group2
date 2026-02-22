@@ -1,15 +1,28 @@
 import json
+import logging
 import re
+import time
 from typing import List, TypedDict
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 
 load_dotenv()
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger("leads_agent")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
+    )
+    logger.addHandler(_handler)
+    logger.setLevel(logging.DEBUG)
 
 
 def parse_json(text: str | list) -> dict | list:
@@ -80,10 +93,12 @@ def create_leads_agent():
     def categorize_clients(state: LeadsState) -> dict:
         """
         1) Filtro cuantitativo: descarta clientes con gasto < umbral.
-        2) Para cada cliente calificado, llama al LLM individualmente
-           para determinar su categoría de lead (sin score).
+        2) Llama al LLM en **batch** (paralelo) para categorizar todos los
+           clientes calificados de una sola vez.
         """
+        t0 = time.perf_counter()
         threshold = state.get("spending_threshold", 0.0)
+        logger.info("── categorize_clients START ── umbral=%.2f", threshold)
 
         # Parsear gasto desde customer_data (formato: ID | Tel | Consumo)
         spending_info: dict[int, float] = {}
@@ -94,10 +109,13 @@ def create_leads_agent():
                     spending_info[int(parts[0])] = float(parts[2])
                 except ValueError:
                     continue
+        logger.debug("  Clientes parseados: %d", len(spending_info))
 
         # Filtro cuantitativo
         qualified_ids = {k for k, v in spending_info.items() if v >= threshold}
+        logger.info("  Clientes con gasto >= %.2f: %d", threshold, len(qualified_ids))
         if not qualified_ids:
+            logger.warning("  Sin clientes calificados → abortando nodo")
             return {
                 "error": f"No hay clientes con gasto >= S/. {threshold:.2f}",
                 "categorized_leads": [],
@@ -125,27 +143,65 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown):
   "motivo": "<una oración explicando la categoría asignada>"
 }"""
 
-        # Procesar cliente por cliente para no saturar el contexto
-        categorized: List[dict] = []
-        for client_id in sorted(qualified_ids, key=lambda x: spending_info[x], reverse=True):
+        # ── Preparar batch de mensajes ──────────────────────────────────────
+        ordered_ids: List[int] = sorted(
+            qualified_ids, key=lambda x: spending_info[x], reverse=True
+        )
+        batch_inputs: List[List] = []
+        batch_ids: List[int] = []
+        for client_id in ordered_ids:
             feedback = feedback_blocks.get(client_id)
             if not feedback:
+                logger.debug("  Cliente %d sin feedback → omitido", client_id)
                 continue
-
-            messages = [
+            batch_inputs.append([
                 SystemMessage(content=system),
                 HumanMessage(content=f"Feedback del cliente:\n{feedback}"),
-            ]
-            try:
-                response = llm.invoke(messages)
-                result = parse_json(response.content)
+            ])
+            batch_ids.append(client_id)
+
+        logger.info(
+            "  Enviando batch de %d llamadas al LLM (categorización)…",
+            len(batch_inputs),
+        )
+
+        # ── Llamada en batch (paralela internamente) ───────────────────────
+        t_batch = time.perf_counter()
+        responses = llm.batch(
+            batch_inputs,
+            config=RunnableConfig(max_concurrency=10),
+            return_exceptions=True,
+        )
+        logger.info(
+            "  Batch completado en %.2fs (%d respuestas)",
+            time.perf_counter() - t_batch,
+            len(responses),
+        )
+
+        # ── Procesar respuestas ────────────────────────────────────────────
+        categorized: List[dict] = []
+        for client_id, resp in zip(batch_ids, responses):
+            if isinstance(resp, Exception):
+                logger.error("  Cliente %d → error: %s", client_id, str(resp)[:80])
                 categorized.append({
                     "id_cliente": client_id,
                     "consumo": spending_info[client_id],
-                    "categoria": result.get("categoria", "recurrente"),
+                    "categoria": "recurrente",
+                    "motivo": f"Categorización por defecto (error: {str(resp)[:60]})",
+                })
+                continue
+            try:
+                result = parse_json(resp.content)
+                cat = result.get("categoria", "recurrente")
+                logger.debug("  Cliente %d → %s", client_id, cat)
+                categorized.append({
+                    "id_cliente": client_id,
+                    "consumo": spending_info[client_id],
+                    "categoria": cat,
                     "motivo": result.get("motivo", ""),
                 })
             except Exception as e:
+                logger.error("  Cliente %d → parse error: %s", client_id, str(e)[:80])
                 categorized.append({
                     "id_cliente": client_id,
                     "consumo": spending_info[client_id],
@@ -153,15 +209,24 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown):
                     "motivo": f"Categorización por defecto (error: {str(e)[:60]})",
                 })
 
+        logger.info(
+            "── categorize_clients END ── %d leads en %.2fs",
+            len(categorized),
+            time.perf_counter() - t0,
+        )
         return {"categorized_leads": categorized}
 
     # ── Nodo 2 ────────────────────────────────────────────────────────────────
     def generate_promotions(state: LeadsState) -> dict:
         """
         Para cada lead categorizado genera un mensaje promocional personalizado
-        de WhatsApp, procesando uno por uno para controlar el contexto.
+        de WhatsApp.  Las llamadas al LLM se ejecutan en **batch** (paralelo).
         """
+        t0 = time.perf_counter()
+        logger.info("── generate_promotions START ──")
+
         if state.get("error") or not state.get("categorized_leads"):
+            logger.warning("  Sin leads categorizados o estado con error → vacío")
             return {"promotions": []}
 
         # Mapa de contacto: id_cliente → {telefono, consumo}
@@ -200,13 +265,13 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown):
   "mensaje_promo": "<mensaje de WhatsApp personalizado>"
 }"""
 
-        promotions: List[dict] = []
-        for lead in state["categorized_leads"]:
+        # ── Preparar batch de mensajes ──────────────────────────────────────
+        leads_list = state["categorized_leads"]
+        batch_inputs: List[List] = []
+        for lead in leads_list:
             id_c = lead["id_cliente"]
             feedback = feedback_blocks.get(id_c, "Sin feedback disponible.")
-            contact = contact_map.get(id_c, {})
-
-            messages = [
+            batch_inputs.append([
                 SystemMessage(content=system),
                 HumanMessage(
                     content=(
@@ -215,13 +280,43 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown):
                         f"Feedback original del cliente:\n{feedback}"
                     )
                 ),
-            ]
-            try:
-                response = llm.invoke(messages)
-                result = parse_json(response.content)
-                mensaje = result.get("mensaje_promo", "")
-            except Exception as e:
-                mensaje = f"[Error al generar mensaje: {str(e)[:60]}]"
+            ])
+
+        logger.info(
+            "  Enviando batch de %d llamadas al LLM (promociones)…",
+            len(batch_inputs),
+        )
+
+        # ── Llamada en batch (paralela internamente) ───────────────────────
+        t_batch = time.perf_counter()
+        responses = llm.batch(
+            batch_inputs,
+            config=RunnableConfig(max_concurrency=10),
+            return_exceptions=True,
+        )
+        logger.info(
+            "  Batch completado en %.2fs (%d respuestas)",
+            time.perf_counter() - t_batch,
+            len(responses),
+        )
+
+        # ── Procesar respuestas ────────────────────────────────────────────
+        promotions: List[dict] = []
+        for lead, resp in zip(leads_list, responses):
+            id_c = lead["id_cliente"]
+            contact = contact_map.get(id_c, {})
+
+            if isinstance(resp, Exception):
+                logger.error("  Cliente %d → error: %s", id_c, str(resp)[:80])
+                mensaje = f"[Error al generar mensaje: {str(resp)[:60]}]"
+            else:
+                try:
+                    result = parse_json(resp.content)
+                    mensaje = result.get("mensaje_promo", "")
+                    logger.debug("  Cliente %d → mensaje generado OK", id_c)
+                except Exception as e:
+                    logger.error("  Cliente %d → parse error: %s", id_c, str(e)[:80])
+                    mensaje = f"[Error al generar mensaje: {str(e)[:60]}]"
 
             promotions.append({
                 "id_cliente": id_c,
@@ -232,6 +327,11 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown):
                 "mensaje_promo": mensaje,
             })
 
+        logger.info(
+            "── generate_promotions END ── %d promos en %.2fs",
+            len(promotions),
+            time.perf_counter() - t0,
+        )
         return {"promotions": promotions}
 
     # ── Nodo 3 — HITL ─────────────────────────────────────────────────────────
@@ -240,7 +340,12 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown):
         Human-in-the-loop: pausa el grafo y devuelve las promociones al frontend.
         Se reanuda con Command(resume=leads_aprobados).
         """
+        logger.info(
+            "── human_review ── %d promociones pendientes de revisión",
+            len(state.get("promotions", [])),
+        )
         approved = interrupt(state["promotions"])
+        logger.info("── human_review RESUMED ── %d leads aprobados", len(approved))
         return {"approved_leads": approved}
 
     # ── Construcción del grafo ─────────────────────────────────────────────────
@@ -264,6 +369,11 @@ def regenerate_single_promotion(lead: dict, instructions: str, feedback: str) ->
     siguiendo las instrucciones del revisor humano.
     Llamado desde el frontend durante la fase de revisión HITL.
     """
+    logger.info(
+        "── regenerate_single_promotion ── cliente=%s cat=%s",
+        lead.get("id_cliente"), lead.get("categoria"),
+    )
+    t0 = time.perf_counter()
     llm = _get_llm()
 
     system = """Eres copywriter experto en marketing de restaurantes peruanos.
@@ -297,6 +407,11 @@ Devuelve ÚNICAMENTE un JSON válido (sin markdown):
     try:
         response = llm.invoke(messages)
         result = parse_json(response.content)
-        return result.get("mensaje_promo", lead.get("mensaje_promo", ""))
-    except Exception:
+        new_msg = result.get("mensaje_promo", lead.get("mensaje_promo", ""))
+        logger.info(
+            "  Mensaje regenerado en %.2fs", time.perf_counter() - t0
+        )
+        return new_msg
+    except Exception as e:
+        logger.error("  Error regenerando mensaje: %s", str(e)[:80])
         return lead.get("mensaje_promo", "")
