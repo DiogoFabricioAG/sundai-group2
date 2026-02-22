@@ -52,6 +52,23 @@ def df_to_text(df: pd.DataFrame) -> str:
     return "\n\n".join(records)
 
 
+def get_feedback_blocks(df: pd.DataFrame) -> dict:
+    """Retorna un dict {id_cliente: texto_feedback} para uso en regeneración HITL."""
+    blocks = {}
+    for _, row in df.iterrows():
+        blocks[int(row[COL_ID])] = (
+            f"Cliente {row[COL_ID]}:\n"
+            f"- Consumo: S/. {row[COL_CONSUMO]}\n"
+            f"- Qué mejoraría de la atención: {row[COL_MEJORA_ATENCION]}\n"
+            f"- Cómo le pareció la atención: {row[COL_ATENCION]}\n"
+            f"- Qué le gustó más de la comida: {row[COL_COMIDA]}\n"
+            f"- Opinión calidad/precio: {row[COL_PRECIO_CALIDAD]}\n"
+            f"- Qué le gustó del ambiente: {row[COL_AMBIENTE]}\n"
+            f"- Qué cambiaría: {row[COL_CAMBIO]}"
+        )
+    return blocks
+
+
 def get_customer_contact_data(df: pd.DataFrame) -> str:
     """Retorna datos de contacto de clientes en formato texto para el LLM."""
     lines = ["ID_Cliente | Telefono | Consumo (S/.)"]

@@ -1,0 +1,9 @@
+tag,category,synonyms,enabled
+mesero,atencion,mesero|mozo|mozos|personal|recepcion|garzon|garzón,1
+tiempo_espera,atencion,espera|demora|tard|lento|rapidez|agil|ágil,1
+cobro,atencion,cuenta|cobraron|cobro|vuelto|pago|recargo,1
+comida,comida,comida|sabor|plato|ceviche|lomo|aji|ají|arroz|postre|menu|menú,1
+salado,comida,salado|salada|sal,1
+precio,precio_calidad,precio|caro|economico|económico|valor|porciones|costo,1
+ambiente,ambiente,ambiente|musica|música|ruido|iluminacion|iluminación|terraza|decoracion|decoración|olor,1
+experiencia,experiencia_general,experiencia|reserva|aforo|trato|servicio|general,1

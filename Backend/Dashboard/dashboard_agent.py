@@ -1,12 +1,72 @@
 import json
+import logging
+import re
 from typing import TypedDict
+
+import pandas as pd
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
+from Backend.Dashboard.tag_analytics import run_incremental_tag_pipeline
+
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def parse_json(text: str | list) -> dict | list:
+    """
+    Parsea JSON de la respuesta del LLM con 3 estrategias de fallback:
+      1. Parseo directo.
+      2. Eliminar bloque de markdown (```json ... ``` o ``` ... ```).
+      3. Extraer el primer objeto/arreglo JSON encontrado en el texto.
+
+    También maneja el caso en que `response.content` es una lista de partes
+    (comportamiento ocasional de langchain-google-genai).
+    """
+    # Normalizar a string si el modelo devuelve lista de partes
+    if isinstance(text, list):
+        parts = []
+        for part in text:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(part.get("text", ""))
+        text = "\n".join(parts)
+
+    text = text.strip()
+
+    # Estrategia 1 — parseo directo
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Estrategia 2 — eliminar bloque de markdown
+    clean = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text)
+    clean = re.sub(r"\n?```\s*$", "", clean).strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+
+    # Estrategia 3 — extraer primer objeto o arreglo JSON del texto
+    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"No se pudo parsear JSON. Respuesta recibida:\n{text[:300]}")
 
 
 class DashboardState(TypedDict):
@@ -15,13 +75,51 @@ class DashboardState(TypedDict):
     key_themes: dict
     summary: dict
     error: str
+    metadata: dict
+
+
+def _parse_llm_json(content, node_name: str) -> dict:
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item.get("text", "")))
+            else:
+                parts.append(str(item))
+        text = "\n".join(parts).strip()
+    else:
+        text = str(content).strip()
+
+    if not text:
+        raise ValueError("Respuesta vacía del modelo")
+
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        obj_match = re.search(r"\{[\s\S]*\}", text)
+        if obj_match:
+            return json.loads(obj_match.group(0))
+
+        logger.error(
+            "[%s] No se pudo parsear JSON. Respuesta recibida (preview): %s",
+            node_name,
+            text[:300],
+        )
+        raise
 
 
 def create_dashboard_agent():
-    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 
     def analyze_sentiment(state: DashboardState) -> dict:
         """Nodo 1: Calcula scores de sentimiento por categoría."""
+        logger.info("[analyze_sentiment] Inicio")
         system = """Eres un analista de experiencia del cliente para restaurantes peruanos.
 Analiza los feedbacks y devuelve ÚNICAMENTE un JSON válido (sin markdown, sin texto adicional) con:
 {
@@ -42,15 +140,20 @@ Analiza los feedbacks y devuelve ÚNICAMENTE un JSON válido (sin markdown, sin 
         ]
         try:
             response = llm.invoke(messages)
-            scores = json.loads(response.content)
+            scores = _parse_llm_json(response.content, "analyze_sentiment")
+            logger.info("[analyze_sentiment] OK")
             return {"sentiment_scores": scores}
         except Exception as e:
+            logger.exception("[analyze_sentiment] Error")
             return {"error": str(e), "sentiment_scores": {}}
 
     def extract_themes(state: DashboardState) -> dict:
         """Nodo 2: Extrae temas, quejas y elogios principales."""
         if state.get("error"):
+            logger.warning("[extract_themes] Saltado por error previo")
             return {}
+
+        logger.info("[extract_themes] Inicio")
 
         system = """Eres un analista de experiencia del cliente para restaurantes peruanos.
 Extrae los temas principales de los feedbacks y devuelve ÚNICAMENTE un JSON válido (sin markdown) con:
@@ -68,15 +171,20 @@ Extrae los temas principales de los feedbacks y devuelve ÚNICAMENTE un JSON vá
         ]
         try:
             response = llm.invoke(messages)
-            themes = json.loads(response.content)
+            themes = _parse_llm_json(response.content, "extract_themes")
+            logger.info("[extract_themes] OK")
             return {"key_themes": themes}
         except Exception as e:
+            logger.exception("[extract_themes] Error")
             return {"error": str(e), "key_themes": {}}
 
     def build_summary(state: DashboardState) -> dict:
         """Nodo 3: Genera el resumen ejecutivo."""
         if state.get("error"):
+            logger.warning("[build_summary] Saltado por error previo")
             return {}
+
+        logger.info("[build_summary] Inicio")
 
         system = """Eres un consultor de restaurantes. Genera un resumen ejecutivo del feedback recibido
 y devuelve ÚNICAMENTE un JSON válido (sin markdown) con:
@@ -93,9 +201,11 @@ y devuelve ÚNICAMENTE un JSON válido (sin markdown) con:
         ]
         try:
             response = llm.invoke(messages)
-            summary = json.loads(response.content)
+            summary = _parse_llm_json(response.content, "build_summary")
+            logger.info("[build_summary] OK")
             return {"summary": summary}
         except Exception as e:
+            logger.exception("[build_summary] Error")
             return {"error": str(e), "summary": {}}
 
     # Construcción del grafo
@@ -114,6 +224,9 @@ y devuelve ÚNICAMENTE un JSON válido (sin markdown) con:
 
 def run_dashboard_agent(data_text: str) -> DashboardState:
     """Ejecuta el agente de dashboard y retorna los resultados."""
+    logger.info("[run_dashboard_agent] Inicio de ejecución")
+    logger.info("[run_dashboard_agent] Tamaño de entrada: %s caracteres", len(data_text))
+
     agent = create_dashboard_agent()
     initial_state: DashboardState = {
         "raw_data": data_text,
@@ -121,5 +234,56 @@ def run_dashboard_agent(data_text: str) -> DashboardState:
         "key_themes": {},
         "summary": {},
         "error": "",
+        "metadata": {},
     }
-    return agent.invoke(initial_state)
+
+    try:
+        logger.info("[run_dashboard_agent] Invocando grafo de LangGraph")
+        result = agent.invoke(initial_state)
+
+        if result.get("error"):
+            logger.error(
+                "[run_dashboard_agent] Finalizó con error reportado en estado: %s",
+                result.get("error"),
+            )
+        else:
+            logger.info("[run_dashboard_agent] Finalizó correctamente")
+
+        logger.info(
+            "[run_dashboard_agent] Resultado -> sentiment_scores=%s, key_themes=%s, summary=%s",
+            bool(result.get("sentiment_scores")),
+            bool(result.get("key_themes")),
+            bool(result.get("summary")),
+        )
+        return result
+    except Exception:
+        logger.exception("[run_dashboard_agent] Error no controlado durante la ejecución")
+        raise
+
+
+def run_dashboard_agent_from_df(df: pd.DataFrame) -> DashboardState:
+    """Ejecuta análisis incremental por tags con persistencia en CSV."""
+    logger.info("[run_dashboard_agent_from_df] Inicio de pipeline incremental")
+    logger.info("[run_dashboard_agent_from_df] Filas recibidas: %s", len(df))
+
+    result = run_incremental_tag_pipeline(df)
+
+    if result.get("error"):
+        logger.error("[run_dashboard_agent_from_df] Error: %s", result.get("error"))
+    else:
+        metadata = result.get("metadata", {})
+        logger.info(
+            "[run_dashboard_agent_from_df] OK | nuevos_rows=%s | nuevos_events=%s | total_events=%s",
+            metadata.get("new_rows_processed", 0),
+            metadata.get("new_tag_events", 0),
+            metadata.get("events", 0),
+        )
+
+    return {
+        "raw_data": "",
+        "sentiment_scores": result.get("sentiment_scores", {}),
+        "key_themes": result.get("key_themes", {}),
+        "summary": result.get("summary", {}),
+        "error": result.get("error", ""),
+        "metadata": result.get("metadata", {}),
+    }
