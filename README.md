@@ -6,12 +6,13 @@ Plataforma de inteligencia artificial para analizar el feedback de comensales de
 
 ## ¿Qué hace?
 
-A partir de un CSV con preguntas y respuestas de comensales, la plataforma ofrece dos módulos principales:
+A partir de un CSV con preguntas y respuestas de comensales, la plataforma ofrece tres módulos principales:
 
 | Módulo | Descripción |
 |---|---|
 | **📊 Dashboard de Análisis** | Visualiza scores de sentimiento, temas principales, platos destacados y un resumen ejecutivo generado por IA |
 | **🎯 Generador de Leads** | Identifica y puntúa clientes con potencial de retorno o fidelización, con acciones de CRM sugeridas |
+| **🤖 Chatbot Restaurante** | Módulo conversacional para encuestas de satisfacción y generación de códigos de descuento |
 
 ---
 
@@ -33,12 +34,18 @@ hackSundAI/
 ├── app.py                            # Página Home (punto de entrada de Streamlit)
 ├── pages/                            # Vistas Streamlit (debe estar en la raíz)
 │   ├── 1_Dashboard.py                # Vista de Dashboard con gráficos
-│   └── 2_Leads.py                    # Vista de Leads generados por IA
+│   ├── 2_Leads.py                    # Vista de Leads generados por IA
+│   ├── 3_Marketing.py                # Vista de Marketing
+│   └── 4_Chatbot.py                  # Vista Chatbot Restaurante
 ├── Backend/
 │   ├── Dashboard/
 │   │   └── dashboard_agent.py        # Agente LangGraph para análisis de feedback
-│   └── Leads/
-│       └── leads_agent.py            # Agente LangGraph para generación de leads
+│   ├── Leads/
+│   │   └── leads_agent.py            # Agente para generación de leads
+│   ├── Marketing/
+│   │   └── marketing_agent.py        # Agente de marketing
+│   └── Chatbot/
+│       └── chatbot.py                # Lógica del chatbot restaurante
 ├── Frontend/
 │   └── utils/
 │       └── data_loader.py            # Carga y preprocesamiento del CSV
@@ -102,6 +109,8 @@ La app se abrirá en `http://localhost:8501`. Desde la página **Home** puedes n
 
 - **Dashboard** — para ver el análisis de sentimiento y temas
 - **Leads** — para ver los leads identificados y exportarlos
+- **Marketing** — para ver las promociones generadas
+- **Chatbot** — para interactuar con el chatbot
 
 ---
 
