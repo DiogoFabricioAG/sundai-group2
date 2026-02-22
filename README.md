@@ -127,30 +127,47 @@ El archivo `Data/data.csv` contiene respuestas de comensales a 6 preguntas:
 
 ### `dashboard_agent.py`
 
-Grafo de 3 nodos ejecutados en secuencia:
+Grafo de 3 nodos ejecutados en secuencia (sin checkpointer):
 
 ```
 analyze_sentiment → extract_themes → build_summary → END
 ```
 
-| Nodo | Función |
-|---|---|
-| `analyze_sentiment` | Calcula scores (0–10) para atención, comida, precio/calidad, ambiente y experiencia general |
-| `extract_themes` | Extrae elogios, quejas, platos destacados y áreas de mejora |
-| `build_summary` | Genera un resumen ejecutivo con fortaleza principal y recomendación urgente |
+**Estado:** `DashboardState` — `raw_data`, `sentiment_scores`, `key_themes`, `summary`, `error`
+
+| Nodo | Salida | Descripción |
+|---|---|---|
+| `analyze_sentiment` | `sentiment_scores` | Scores 0–10 para `atencion`, `comida`, `precio_calidad`, `ambiente`, `experiencia_general` + conteo de clientes `positivos / negativos / neutros` |
+| `extract_themes` | `key_themes` | Listas de `top_praises`, `top_complaints`, `top_dishes` y `improvement_areas` (5 / 5 / 3 / 3 ítems) |
+| `build_summary` | `summary` | Resumen ejecutivo con `resumen`, `fortaleza_principal` y `recomendacion_principal` |
+
+**Función pública:** `run_dashboard_agent(data_text: str) -> DashboardState`
+
+**Modelo:** `gemini-3-flash-preview` · temperature=0
+
+---
 
 ### `leads_agent.py`
 
-Grafo de 2 nodos:
+Grafo de 3 nodos con **Human-in-the-Loop (HITL)** y `MemorySaver` checkpointer:
 
 ```
-score_customers → enrich_leads → END
+categorize_clients → generate_promotions → human_review → END
 ```
 
-| Nodo | Función |
-|---|---|
-| `score_customers` | Puntúa cada cliente (1–10) y lo categoriza como: `alto_valor`, `retencion`, `recurrente` o `referidor` |
-| `enrich_leads` | Ordena los leads por score y prepara los datos para la vista |
+**Estado:** `LeadsState` — `raw_data`, `customer_data`, `spending_threshold`, `categorized_leads`, `promotions`, `approved_leads`, `error`
+
+| Nodo | Salida | Descripción |
+|---|---|---|
+| `categorize_clients` | `categorized_leads` | Filtra clientes por `spending_threshold`, luego llama al LLM en **batch** (`max_concurrency=10`) para asignar categoría: `alto_valor`, `retencion`, `recurrente` o `referidor` |
+| `generate_promotions` | `promotions` | Genera mensajes de WhatsApp personalizados en **batch** para cada lead categorizado |
+| `human_review` | `approved_leads` | Pausa el grafo con `interrupt()` y devuelve las promociones al frontend; se reanuda con `Command(resume=leads_aprobados)` |
+
+**Función auxiliar:** `regenerate_single_promotion(lead, instructions, feedback) -> str`  
+Regenera el mensaje de un lead individual siguiendo las instrucciones del revisor (llamada desde el frontend durante la fase HITL).
+
+**Modelo:** `gemini-3-flash-preview` · temperature=0  
+**Checkpointer:** `MemorySaver` compartido en memoria (persiste durante la sesión del servidor)
 
 ---
 
